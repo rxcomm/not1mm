@@ -44,7 +44,7 @@ logger = logging.getLogger(__name__)
 
 ALTEREGO = None
 
-EXCHANGE_HINT = "Name + Member No./'CWA'"
+EXCHANGE_HINT = "Name + Member No./'CWA' (single box, space separated)"
 
 name = "CWT"
 mode = "CW"  # CW SSB BOTH RTTY
@@ -62,7 +62,10 @@ columns = [
 ]
 cabrillo_name = "CW-OPS"
 
-advance_on_space = [True, True, True, True, True]
+# other_1 (index 3) is the single combined Name + Number/State exchange box,
+# so a space typed there must stay in the field instead of stripping it and
+# jumping focus to the next field. other_2 is unused and hidden.
+advance_on_space = [True, True, True, False, False]
 
 # 1 once per contest, 2 work each band, 3 each band/mode, 4 no dupe checking
 dupe_type = 2
@@ -81,15 +84,13 @@ def interface(self):
     self.field1.hide()
     self.field2.hide()
     self.field3.show()
-    self.field4.show()
+    self.field4.hide()
     self.snt_label.setText("SNT")
     self.field1.setAccessibleName("RST Sent")
-    self.other_label.setText(QtWidgets.QApplication.translate("ContestPlugin", "Name"))
-    self.field3.setAccessibleName("Name")
-    self.exch_label.setText(
-        QtWidgets.QApplication.translate("ContestPlugin", "Number or State")
+    self.other_label.setText(
+        QtWidgets.QApplication.translate("ContestPlugin", "Name + Nr/State")
     )
-    self.field4.setAccessibleName("Number or State")
+    self.field3.setAccessibleName("Name + Number or State")
 
 
 def reset_label(self):
@@ -100,26 +101,38 @@ def set_tab_next(self):
     """Set TAB Advances"""
     self.tab_next = {
         self.callsign: self.other_1,
-        self.other_1: self.other_2,
-        self.other_2: self.callsign,
+        self.other_1: self.callsign,
     }
 
 
 def set_tab_prev(self):
     """Set TAB Advances"""
     self.tab_prev = {
-        self.callsign: self.other_2,
+        self.callsign: self.other_1,
         self.other_1: self.callsign,
-        self.other_2: self.other_1,
     }
+
+
+def split_exchange(text):
+    """Split the combined 'Name Number/State' exchange box into its parts.
+
+    The name is the first word, everything after the first space is the
+    member number or state/province. Returns (name, number), both upper
+    cased and stripped.
+    """
+    parts = text.upper().split(None, 1)
+    exchange_name = parts[0] if parts else ""
+    exchange_number = parts[1].strip() if len(parts) > 1 else ""
+    return exchange_name, exchange_number
 
 
 def set_contact_vars(self):
     """Contest Specific"""
     self.contact["SNT"] = self.sent.text()
     self.contact["RCV"] = self.receive.text()
-    self.contact["Name"] = self.other_1.text().upper()
-    self.contact["NR"] = self.other_1.text().upper() + " " + self.other_2.text().upper()
+    exchange_name, exchange_number = split_exchange(self.other_1.text())
+    self.contact["Name"] = exchange_name
+    self.contact["NR"] = f"{exchange_name} {exchange_number}".strip()
     self.contact["SentNr"] = self.contest_settings.get("SentExchange", "").upper()
     result = self.database.fetch_call_exists(self.callsign.text().upper())
     logger.debug("%s", f"{result}")
@@ -131,18 +144,16 @@ def set_contact_vars(self):
 
 def predupe(self):
     """prefill his exchange with last known values"""
-    if self.other_1.text() == "" and self.other_2.text() == "":
+    if self.other_1.text() == "":
         call = self.callsign.text().upper()
         query = f"select NR from dxlog where Call = '{call}' and ContestName = 'CWOPS-CWT' order by ts desc;"
         logger.debug(query)
         result = self.database.exec_sql(query)
         logger.debug("%s", f"{result}")
         if result:
-            value = result.get("NR", "").upper()
-            if len(value.split()) == 2:
-                parsed_name, suffix = value.split()
-                self.other_1.setText(str(parsed_name))
-                self.other_2.setText(str(suffix))
+            value = result.get("NR", "").upper().strip()
+            if value:
+                self.other_1.setText(value)
 
 
 def prefill(self):
@@ -458,8 +469,7 @@ def ft8_handler(the_packet: dict):
             the_packet.get("SRX_STRING", "") or the_packet.get("SRX", "")
         ).upper()
         ALTEREGO.callsign.setText(the_packet.get("CALL", ""))
-        ALTEREGO.other_1.setText(their_name)
-        ALTEREGO.other_2.setText(their_nr)
+        ALTEREGO.other_1.setText(f"{their_name} {their_nr}".strip())
         ALTEREGO.contact["Call"] = the_packet.get("CALL", "")
         ALTEREGO.contact["SNT"] = ALTEREGO.sent.text()
         ALTEREGO.contact["RCV"] = ALTEREGO.receive.text()
@@ -533,8 +543,8 @@ def process_esm(self, new_focused_widget=None, with_enter=False):
                 buttons_to_send.append(self.esm_dict["HISCALL"])
                 buttons_to_send.append(self.esm_dict["EXCH"])
 
-        elif self.current_widget in ["other_1", "other_2"]:
-            if self.other_2.text() == "" or self.other_1.text() == "":
+        elif self.current_widget == "other_1":
+            if len(self.other_1.text().split()) < 2:
                 self.make_button_green(self.esm_dict["AGN"])
                 buttons_to_send.append(self.esm_dict["AGN"])
             else:
@@ -569,8 +579,8 @@ def process_esm(self, new_focused_widget=None, with_enter=False):
                 self.make_button_green(self.esm_dict["MYCALL"])
                 buttons_to_send.append(self.esm_dict["MYCALL"])
 
-        elif self.current_widget in ["other_1", "other_2"]:
-            if self.other_2.text() == "" or self.other_1.text() == "":
+        elif self.current_widget == "other_1":
+            if len(self.other_1.text().split()) < 2:
                 self.make_button_green(self.esm_dict["AGN"])
                 buttons_to_send.append(self.esm_dict["AGN"])
             else:
@@ -602,9 +612,8 @@ def check_call_history(self):
     if result:
         self.history_info.setText(f"{result.get('UserText', '')}")
         if self.other_1.text() == "":
-            self.other_1.setText(f"{result.get('Name', '')}")
-        if self.other_2.text() == "":
-            self.other_2.setText(f"{result.get('Exch1', '')}")
+            combined = f"{result.get('Name', '')} {result.get('Exch1', '')}".strip()
+            self.other_1.setText(combined)
 
 
 # --------RTC Stuff-----------
