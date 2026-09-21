@@ -565,6 +565,79 @@ class DataBase:
         #                            ORDER BY Total DESC
         return self.exec_sql_mult(query)
 
+    def fetch_dxcc_count_for_band(self, band) -> dict:
+        """
+        Fetch count of unique DXCC entities (CountryPrefix) worked on a
+        single band. Used for contests, like CQ WW, where DXCC is a mult
+        once per band.
+        {dxcc_count: count}
+        """
+        return self.exec_sql(
+            "select count(DISTINCT(CountryPrefix)) as dxcc_count from dxlog "
+            "where ContestNR = ? and Band = ?;",
+            (self.current_contest, band),
+        )
+
+    def fetch_zone_count_for_band(self, band) -> dict:
+        """
+        Fetch count of unique CQ zones (ZN) worked on a single band. Used
+        for contests, like CQ WW, where zone is a mult once per band.
+        {zone_count: count}
+        """
+        return self.exec_sql(
+            "select count(DISTINCT(ZN)) as zone_count from dxlog "
+            "where ContestNR = ? and Band = ?;",
+            (self.current_contest, band),
+        )
+
+    def fetch_section_count(self) -> dict:
+        """
+        Fetch count of unique ARRL/RAC sections (Sect) worked so far.
+        Used for contests, like ARRL Sweepstakes, where a section is a
+        mult once for the whole contest, not per band.
+        {section_count: count}
+        """
+        return self.exec_sql(
+            "select count(DISTINCT(Sect)) as section_count from dxlog "
+            "where ContestNR = ?;",
+            (self.current_contest,),
+        )
+
+    def fetch_worked_sections(self) -> list:
+        """
+        Fetch the list of distinct, non-empty ARRL/RAC sections worked so
+        far in the current contest.
+        [{sect: 'CT'}, {sect: 'WMA'}, ...]
+        """
+        return self.exec_sql_mult(
+            "select DISTINCT(Sect) as sect from dxlog "
+            "where ContestNR = ? and Sect is not NULL and Sect != '';",
+            (self.current_contest,),
+        )
+
+    def fetch_wpx_count_for_band(self, band) -> dict:
+        """
+        Fetch count of unique WPX prefixes worked on a single band.
+        {wpx_count: count}
+        """
+        return self.exec_sql(
+            "select count(DISTINCT(WPXPrefix)) as wpx_count from dxlog "
+            "where ContestNR = ? and Band = ?;",
+            (self.current_contest, band),
+        )
+
+    def fetch_wpx_band_count(self) -> dict:
+        """
+        Fetch count of unique WPX prefixes worked, once per band, for
+        the whole contest.
+        {wpxb_count: count}
+        """
+        return self.exec_sql(
+            "select count(DISTINCT(WPXPrefix || ':' || Band)) as wpxb_count "
+            "from dxlog where ContestNR = ?;",
+            (self.current_contest,),
+        )
+
     def fetch_exchange1_unique_count(self) -> dict:
         """
         Fetch count of unique countries
