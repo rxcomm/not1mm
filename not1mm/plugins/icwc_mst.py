@@ -42,7 +42,7 @@ logger = logging.getLogger(__name__)
 
 ALTEREGO = None
 
-EXCHANGE_HINT = "NAME"
+EXCHANGE_HINT = "Name + QSO Serial Number (single box, space separated)"
 
 name = "ICWC Medium Speed Test"
 cabrillo_name = "ICWC-MST"
@@ -113,16 +113,27 @@ def set_tab_prev(self):
     }
 
 
+def split_exchange(text):
+    """Split the combined 'Name SerialNumber' exchange box into its parts.
+
+    The name is the first word, everything after the first space is the
+    QSO serial number. Returns (name, number), both upper cased and
+    stripped.
+    """
+    parts = text.upper().split(None, 1)
+    exchange_name = parts[0] if parts else ""
+    exchange_number = parts[1].strip() if len(parts) > 1 else ""
+    return exchange_name, exchange_number
+
+
 def set_contact_vars(self):
     """Contest Specific"""
     self.contact["SNT"] = "599"
     self.contact["RCV"] = "599"
     self.contact["SentNr"] = self.other_1.text()
-    exch = self.other_2.text().upper()
-    if " " in exch:
-        self.contact["Name"], self.contact["NR"] = exch.split(" ")
-    else:
-        self.contact["Name"] = exch
+    exchange_name, exchange_number = split_exchange(self.other_2.text())
+    self.contact["Name"] = exchange_name
+    self.contact["NR"] = exchange_number
 
 
 def predupe(self):  # pylint: disable=unused-argument
