@@ -1,0 +1,742 @@
+diff --git a/not1mm/lib/entry_rows.py b/not1mm/lib/entry_rows.py
+new file mode 100644
+index 00000000..6c3617b3
+--- /dev/null
++++ b/not1mm/lib/entry_rows.py
+@@ -0,0 +1,119 @@
++"""
++Second entry row for SO2V: the run radio's QSO on top, the S&P radio's below.
++GPL V3
++
++Contest plugins reach the entry widgets by name at call time --
++self.callsign.text(), self.other_1.setText(), self.field3.show() -- across
++~3,700 call sites in 96 plugins. Rather than touch them, MainWindow rebinds the
++five line-edit names to whichever row is active, and replaces the label and
++field-frame names with FanOut proxies so a plugin hiding a field or renaming a
++label does it on both rows at once.
++
++The S&P row is cloned from main.ui's own entry-row layout, so it matches the
++run row exactly: same widgets, sizes, stretch, labels.
++"""
++
++import copy
++import io
++import xml.etree.ElementTree as ET
++from pathlib import Path
++
++from PyQt6 import QtWidgets, uic
++
++if __name__ == "__main__":
++    print("I'm not the program you are looking for.")
++
++# The five entry line edits, rebound to the active row.
++ENTRY_ROLES = ("callsign", "sent", "receive", "other_1", "other_2")
++# Field frames and their labels, fanned out to both rows.
++FRAME_NAMES = ("callsignfield", "field1", "field2", "field3", "field4")
++LABEL_NAMES = ("callsign_label", "snt_label", "rcv_label", "other_label", "exch_label")
++
++ENTRY_ROW_LAYOUT = "horizontalLayout"
++
++
++class FanOut:
++    """Stands in for one widget that exists once per row.
++
++    Mutating calls go to every row; queries answer from the first (the run
++    row), which is what a single-row window would have answered.
++    """
++
++    BROADCAST = frozenset(
++        {
++            "show",
++            "hide",
++            "setVisible",
++            "setHidden",
++            "setEnabled",
++            "setText",
++            "setToolTip",
++            "setAccessibleName",
++            "setAccessibleDescription",
++            "setStyleSheet",
++            "setFont",
++            "setPalette",
++            "setAlignment",
++            "setWordWrap",
++            "clear",
++        }
++    )
++
++    def __init__(self, *widgets) -> None:
++        object.__setattr__(self, "_widgets", widgets)
++
++    @property
++    def widgets(self):
++        return self._widgets
++
++    def __getattr__(self, name):
++        first = getattr(self._widgets[0], name)
++        if name == "findChild":
++
++            def find(*args, **kwargs):
++                found = [w.findChild(*args, **kwargs) for w in self._widgets]
++                if any(child is None for child in found):
++                    return found[0]
++                return FanOut(*found)
++
++            return find
++        if name in self.BROADCAST and callable(first):
++
++            def fan(*args, **kwargs):
++                result = first(*args, **kwargs)
++                for widget in self._widgets[1:]:
++                    getattr(widget, name)(*args, **kwargs)
++                return result
++
++            return fan
++        return first
++
++    def __setattr__(self, name, value):
++        for widget in self._widgets:
++            setattr(widget, name, value)
++
++
++def entry_row_ui_xml(ui_file: Path) -> str:
++    """A standalone .ui document holding a copy of main.ui's entry row."""
++    root = ET.parse(ui_file).getroot()
++    layout = root.find(f".//layout[@name='{ENTRY_ROW_LAYOUT}']")
++    if layout is None:
++        raise ValueError(f"{ui_file} has no layout named {ENTRY_ROW_LAYOUT}")
++    ui = ET.Element("ui", version="4.0")
++    ET.SubElement(ui, "class").text = "SpEntryRow"
++    widget = ET.SubElement(ui, "widget", {"class": "QWidget", "name": "SpEntryRow"})
++    widget.append(copy.deepcopy(layout))
++    return ET.tostring(ui, encoding="unicode")
++
++
++def build_entry_row(ui_file: Path, like_layout=None) -> QtWidgets.QWidget:
++    """Build the S&P entry row. Every named widget from the run row exists on
++    the returned QWidget under the same attribute name."""
++    row = QtWidgets.QWidget()
++    uic.loadUi(io.StringIO(entry_row_ui_xml(ui_file)), row)
++    # As a widget's top-level layout it would pick up default margins the
++    # nested original does not have, and the columns would stop lining up.
++    row.layout().setContentsMargins(0, 0, 0, 0)
++    if like_layout is not None:
++        row.layout().setSpacing(like_layout.spacing())
++    return row
+diff --git a/not1mm/lib/flexcat_tx.py b/not1mm/lib/flexcat_tx.py
+new file mode 100644
+index 00000000..ec7b89ef
+--- /dev/null
++++ b/not1mm/lib/flexcat_tx.py
+@@ -0,0 +1,116 @@
++"""
++TX-slice selection for SO2V over TCI, via AetherSDR's FlexCAT port.
++GPL V3
++
++AetherSDR's TCI server cannot move TX without keying: cw_macros validates its
++trx index and then sends through CWX on whichever slice already holds TX, and
++the active_slice / tx_enable SETs are ignored. Its FlexCAT (SmartSDR CAT)
++port can: with the port's VFO A bound to slice A and VFO B to slice B,
++
++    FT1;  ->  slice B becomes the TX slice
++    FT0;  ->  TX goes back to slice A
++
++Neither keys the radio. Neither returns a reply on success either, so this
++class only writes, draining anything the server does send so the socket
++buffer never fills.
++
++The connection is held open for the session: AetherSDR undoes an FT1 when the
++CAT client that sent it disconnects, which would hand TX back to slice A behind
++not1mm's back.
++"""
++
++import logging
++import socket
++
++if __name__ == "__main__":
++    print("I'm not the program you are looking for.")
++
++logger = logging.getLogger("flexcat_tx")
++
++CONNECT_TIMEOUT_S = 0.5
++
++
++class FlexCatTxSelect:
++    """Moves the Flex TX slice between trx 0 (VFO A) and trx 1 (VFO B)."""
++
++    def __init__(self, host: str, port: int) -> None:
++        self.host = host
++        self.port = int(port)
++        self.sock: socket.socket | None = None
++        self.warned = False
++
++    @staticmethod
++    def command_for(trx: int) -> str:
++        """FT1 puts TX on VFO B; FT0 returns it to VFO A.
++
++        AetherSDR's FT1 is a no-op while that CAT session already believes it
++        has split engaged, so the swap must alternate FT1/FT0 -- never repeat
++        FT1 for a second trx-1 selection without an FT0 in between. The SO2V
++        swap alternates by construction, and a fresh connection starts with
++        split disengaged.
++        """
++        return "FT1;" if int(trx) == 1 else "FT0;"
++
++    def connect(self) -> bool:
++        self.close()
++        try:
++            self.sock = socket.create_connection(
++                (self.host, self.port), timeout=CONNECT_TIMEOUT_S
++            )
++            self.sock.setblocking(False)
++            self.warned = False
++            logger.info("FlexCAT TX select connected to %s:%d", self.host, self.port)
++            return True
++        except OSError as err:
++            self.sock = None
++            if not self.warned:
++                logger.warning(
++                    "FlexCAT TX select: cannot reach %s:%d (%s). TX will stay "
++                    "on its current slice; enable AetherSDR's FlexCAT port.",
++                    self.host,
++                    self.port,
++                    err,
++                )
++                self.warned = True
++            return False
++
++    def drain(self) -> None:
++        if self.sock is None:
++            return
++        try:
++            while True:
++                data = self.sock.recv(4096)
++                if not data:  # server closed the connection
++                    self.close()
++                    return
++                logger.debug("FlexCAT < %s", data.decode(errors="replace"))
++        except BlockingIOError:
++            return
++        except OSError:
++            self.close()
++
++    def select_tx(self, trx: int) -> bool:
++        """Put TX on the slice for this trx. True if the command was sent."""
++        command = self.command_for(trx).encode()
++        for _attempt in (1, 2):  # one reconnect: AetherSDR may have restarted
++            if self.sock is None and not self.connect():
++                return False
++            self.drain()
++            if self.sock is None:
++                continue
++            try:
++                self.sock.sendall(command)
++                logger.debug("FlexCAT > %s", command.decode())
++                return True
++            except OSError as err:
++                logger.info("FlexCAT TX select send failed (%s), reconnecting", err)
++                self.close()
++        return False
++
++    def close(self) -> None:
++        if self.sock is not None:
++            try:
++                self.sock.close()
++            except OSError:
++                pass
++            self.sock = None
+diff --git a/not1mm/lib/so2v_tx.py b/not1mm/lib/so2v_tx.py
+new file mode 100644
+index 00000000..d15b44de
+--- /dev/null
++++ b/not1mm/lib/so2v_tx.py
+@@ -0,0 +1,181 @@
++"""
++Transmit arbiter for SO2V over TCI with one transmitter.
++GPL V3
++
++Two receivers, one transmitter. The run radio (trx 0) keeps calling CQ while
++the operator works stations on the S&P radio (trx 1); every CW transmission is
++routed to the slice it belongs to by moving TX between transmissions.
++
++Rules:
++  * TX is only ever moved while nothing is transmitting.
++  * A send to the radio that already holds TX goes straight out (CWX appends
++    to its own buffer), exactly as before SO2V.
++  * A manual send to the other radio interrupts an auto-CQ in progress: the
++    CQ is aborted, the send goes out, and on_cq_interrupted fires so the CQ
++    can be resumed.
++  * Any other send to the other radio waits for the current transmission to
++    end, then TX moves and it goes out.
++  * When idle, TX is handed back to the focused radio, so voice keying and
++    anything else that does not pass through here keys the radio in focus.
++
++Pure Python, no Qt: MainWindow calls tick() from a timer and supplies the
++radio operations as callables, so the logic is testable with a fake clock.
++"""
++
++import logging
++import time
++from collections import deque
++from dataclasses import dataclass, field
++
++if __name__ == "__main__":
++    print("I'm not the program you are looking for.")
++
++logger = logging.getLogger("so2v_tx")
++
++# A send that never keys the radio (empty text, radio refused it) must not
++# wedge the arbiter.
++START_TIMEOUT_S = 2.0
++# How long to wait for an aborted CQ to unkey before giving up waiting.
++STOP_TIMEOUT_S = 2.0
++
++
++@dataclass
++class Transmission:
++    trx: int
++    kind: str  # "cq" (auto-CQ) or "manual"
++    sent_at: float
++    started: bool = False
++
++
++@dataclass
++class So2vTxArbiter:
++    is_transmitting: object  # () -> bool
++    select_tx: object  # (trx) -> bool, moves the TX slice
++    sendcw: object  # (trx, text) -> None, sends through the current TX slice
++    stopcw: object  # () -> None, aborts the CW in progress
++    clock: object = time.monotonic
++    settle_s: float = 0.15  # time for the radio to apply a TX-slice move
++    on_cq_interrupted: object = None  # () -> None
++
++    tx_slice: int | None = None
++    focus: int = 0
++    queue: deque = field(default_factory=deque)
++    current: Transmission | None = None
++    settle_until: float = 0.0
++    abort_until: float = 0.0
++
++    # ---- state ----
++
++    def init_tx(self, trx: int) -> None:
++        """Put TX on a known slice at startup."""
++        self.focus = int(trx)
++        self.select_tx(self.focus)
++        self.tx_slice = self.focus
++        self.settle_until = self.clock() + self.settle_s
++
++    def set_focus(self, trx: int) -> None:
++        """The operator moved to the other radio. TX follows on the next idle
++        tick, never mid-transmission."""
++        self.focus = int(trx)
++
++    def busy(self) -> bool:
++        """True while anything is transmitting, aborting or waiting to go."""
++        return (
++            self.current is not None
++            or bool(self.queue)
++            or self.abort_until > 0
++            or bool(self.is_transmitting())
++        )
++
++    def needs_tick(self) -> bool:
++        return self.busy() or (self.tx_slice is not None and self.tx_slice != self.focus)
++
++    def clear(self) -> None:
++        """Operator hit stop: drop everything pending."""
++        self.queue.clear()
++        self.current = None
++        self.abort_until = 0.0
++
++    # ---- sending ----
++
++    def send(self, trx: int, text: str, kind: str = "manual") -> None:
++        trx = int(trx)
++        now = self.clock()
++        current = self.current
++        if (
++            not self.queue
++            and self.abort_until == 0
++            and self.tx_slice == trx
++            and now >= self.settle_until
++            and (current is None or current.trx == trx)
++        ):
++            # Same radio as TX: straight out, CWX buffers it behind anything
++            # already sending.
++            self.sendcw(trx, text)
++            if current is None:
++                self.current = Transmission(trx, kind, now)
++            elif kind == "manual":
++                current.kind = "manual"
++            return
++
++        if kind == "manual" and current is not None and current.kind == "cq" and current.trx != trx:
++            logger.debug("SO2V: interrupting CQ on trx %d for trx %d", current.trx, trx)
++            self.stopcw()
++            self.current = None
++            self.abort_until = now + STOP_TIMEOUT_S
++            # Anything else queued for the CQ radio goes with the CQ.
++            self.queue = deque(item for item in self.queue if item[2] != "cq")
++            if self.on_cq_interrupted:
++                self.on_cq_interrupted()
++        self.queue.append((trx, text, kind))
++
++    # ---- driven by a timer ----
++
++    def tick(self) -> None:
++        now = self.clock()
++        transmitting = bool(self.is_transmitting())
++
++        if self.current is not None:
++            if not self.current.started:
++                if transmitting:
++                    self.current.started = True
++                elif now - self.current.sent_at > START_TIMEOUT_S:
++                    logger.debug("SO2V: send on trx %d never keyed", self.current.trx)
++                    self.current = None
++            elif not transmitting:
++                self.current = None
++        if self.current is not None:
++            return
++
++        if self.abort_until:
++            if transmitting and now < self.abort_until:
++                return
++            self.abort_until = 0.0
++        if transmitting:
++            return  # keyed by something outside the arbiter (paddle, PTT)
++
++        if self.queue:
++            trx = self.queue[0][0]
++            if self.tx_slice != trx:
++                self.move_tx(trx, now)
++                return
++            if now < self.settle_until:
++                return
++            _trx, text, kind = self.queue.popleft()
++            self.sendcw(trx, text)
++            self.current = Transmission(trx, kind, now)
++            while self.queue and self.queue[0][0] == trx:
++                _trx, more, more_kind = self.queue.popleft()
++                self.sendcw(trx, more)
++                if more_kind == "manual":
++                    self.current.kind = "manual"
++            return
++
++        if self.tx_slice != self.focus and now >= self.settle_until:
++            self.move_tx(self.focus, now)
++
++    def move_tx(self, trx: int, now: float) -> None:
++        logger.debug("SO2V: TX slice -> trx %d", trx)
++        self.select_tx(trx)
++        self.tx_slice = trx
++        self.settle_until = now + self.settle_s
+diff --git a/test/flexcat_tx_tests.py b/test/flexcat_tx_tests.py
+new file mode 100644
+index 00000000..d5bed5e6
+--- /dev/null
++++ b/test/flexcat_tx_tests.py
+@@ -0,0 +1,114 @@
++import socket
++import threading
++import time
++
++import pytest
++
++from not1mm.lib.flexcat_tx import FlexCatTxSelect
++
++
++class FakeFlexCat:
++    """A TCP listener that records what each connection sends."""
++
++    def __init__(self):
++        self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
++        self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
++        self.server.bind(("127.0.0.1", 0))
++        self.server.listen()
++        self.port = self.server.getsockname()[1]
++        self.received = []
++        self.connections = []
++        self.lock = threading.Lock()
++        threading.Thread(target=self.accept_loop, daemon=True).start()
++
++    def accept_loop(self):
++        while True:
++            try:
++                conn, _ = self.server.accept()
++            except OSError:
++                return
++            with self.lock:
++                self.connections.append(conn)
++            threading.Thread(target=self.read_loop, args=(conn,), daemon=True).start()
++
++    def read_loop(self, conn):
++        while True:
++            try:
++                data = conn.recv(1024)
++            except OSError:
++                return
++            if not data:
++                return
++            with self.lock:
++                self.received.append(data.decode())
++
++    def text(self, wait=0.3):
++        deadline = time.time() + wait
++        while time.time() < deadline:
++            time.sleep(0.02)
++        with self.lock:
++            return "".join(self.received)
++
++    def drop_clients(self):
++        with self.lock:
++            for conn in self.connections:
++                conn.close()
++            self.connections.clear()
++
++    def close(self):
++        self.drop_clients()
++        self.server.close()
++
++
++@pytest.fixture
++def flexcat():
++    server = FakeFlexCat()
++    yield server
++    server.close()
++
++
++def test_command_for_each_trx():
++    assert FlexCatTxSelect.command_for(1) == "FT1;"
++    assert FlexCatTxSelect.command_for(0) == "FT0;"
++
++
++def test_select_tx_sends_ft_commands(flexcat):
++    selector = FlexCatTxSelect("127.0.0.1", flexcat.port)
++    assert selector.select_tx(1) is True
++    assert selector.select_tx(0) is True
++    assert flexcat.text() == "FT1;FT0;"
++    selector.close()
++
++
++def test_connection_is_kept_open_between_selects(flexcat):
++    """AetherSDR undoes FT1 when the sending CAT client disconnects."""
++    selector = FlexCatTxSelect("127.0.0.1", flexcat.port)
++    selector.select_tx(1)
++    selector.select_tx(0)
++    selector.select_tx(1)
++    flexcat.text()
++    assert len(flexcat.connections) == 1
++    selector.close()
++
++
++def test_reconnects_after_server_drops_connection(flexcat):
++    selector = FlexCatTxSelect("127.0.0.1", flexcat.port)
++    selector.select_tx(1)
++    flexcat.text()
++    flexcat.drop_clients()
++    time.sleep(0.1)
++    assert selector.select_tx(0) is True
++    assert flexcat.text().endswith("FT0;")
++    selector.close()
++
++
++def test_unreachable_port_returns_false_and_warns_once(caplog):
++    probe = socket.socket()
++    probe.bind(("127.0.0.1", 0))
++    port = probe.getsockname()[1]
++    probe.close()  # nothing listens here now
++    selector = FlexCatTxSelect("127.0.0.1", port)
++    assert selector.select_tx(1) is False
++    assert selector.select_tx(0) is False
++    warnings = [r for r in caplog.records if "cannot reach" in r.getMessage()]
++    assert len(warnings) == 1
+diff --git a/test/so2v_tx_tests.py b/test/so2v_tx_tests.py
+new file mode 100644
+index 00000000..0c029d38
+--- /dev/null
++++ b/test/so2v_tx_tests.py
+@@ -0,0 +1,182 @@
++import pytest
++
++from not1mm.lib.so2v_tx import So2vTxArbiter
++
++
++class FakeRadio:
++    """One transmitter. Records every operation in order."""
++
++    def __init__(self):
++        self.log = []
++        self.transmitting = False
++        self.t = 0.0
++
++    def clock(self):
++        return self.t
++
++    def advance(self, seconds, arbiter=None, step=0.05):
++        end = self.t + seconds
++        while self.t < end:
++            self.t = round(self.t + step, 6)
++            if arbiter:
++                arbiter.tick()
++
++    def select_tx(self, trx):
++        self.log.append(f"FT{trx}")
++        return True
++
++    def sendcw(self, trx, text):
++        self.log.append(f"cw:{text}")
++
++    def stopcw(self):
++        self.log.append("stop")
++
++
++@pytest.fixture
++def radio():
++    return FakeRadio()
++
++
++@pytest.fixture
++def arb(radio):
++    interrupted = []
++    a = So2vTxArbiter(
++        is_transmitting=lambda: radio.transmitting,
++        select_tx=radio.select_tx,
++        sendcw=radio.sendcw,
++        stopcw=radio.stopcw,
++        clock=radio.clock,
++        settle_s=0.15,
++        on_cq_interrupted=lambda: interrupted.append(radio.t),
++    )
++    a.interrupted = interrupted
++    a.init_tx(0)
++    radio.advance(0.2, a)
++    radio.log.clear()
++    return a
++
++
++def key(radio, arb, seconds):
++    """Radio transmits for `seconds`, then unkeys."""
++    radio.transmitting = True
++    radio.advance(seconds, arb)
++    radio.transmitting = False
++    radio.advance(0.1, arb)
++
++
++def test_send_to_tx_radio_goes_straight_out(radio, arb):
++    arb.send(0, "CQ")
++    assert radio.log == ["cw:CQ"]
++
++
++def test_same_radio_sends_append_while_transmitting(radio, arb):
++    arb.send(0, "CQ", "cq")
++    radio.transmitting = True
++    radio.advance(0.2, arb)
++    arb.send(0, "TU")
++    assert radio.log == ["cw:CQ", "cw:TU"]
++
++
++def test_cq_from_run_while_focus_on_sp_borrows_tx_and_returns_it(radio, arb):
++    arb.set_focus(1)
++    radio.advance(0.3, arb)
++    assert radio.log == ["FT1"]  # idle: TX follows focus
++    radio.log.clear()
++
++    arb.send(0, "CQ", "cq")
++    radio.advance(0.3, arb)
++    assert radio.log == ["FT0", "cw:CQ"]  # moved, settled, sent
++    key(radio, arb, 2.0)
++    radio.advance(0.3, arb)
++    assert radio.log == ["FT0", "cw:CQ", "FT1"]  # handed back after the CQ
++
++
++def test_tx_never_moves_while_transmitting(radio, arb):
++    arb.send(0, "CQ", "cq")
++    radio.transmitting = True
++    arb.set_focus(1)
++    radio.advance(1.0, arb)
++    assert "FT1" not in radio.log
++    radio.transmitting = False
++    radio.advance(0.3, arb)
++    assert radio.log[-1] == "FT1"
++
++
++def test_manual_sp_send_interrupts_cq_then_cq_can_resume(radio, arb):
++    arb.set_focus(1)
++    radio.advance(0.3, arb)
++    arb.send(0, "CQ", "cq")
++    radio.advance(0.3, arb)
++    radio.transmitting = True
++    radio.advance(0.5, arb)  # CQ going out on the run radio
++    radio.log.clear()
++
++    arb.send(1, "K0RX")  # operator answers on the S&P radio
++    assert radio.log == ["stop"]
++    assert arb.interrupted, "CQ interruption reported for resume"
++    radio.advance(0.3, arb)
++    assert radio.log == ["stop"]  # still waiting for the CQ to unkey
++    radio.transmitting = False
++    radio.advance(0.4, arb)
++    assert radio.log == ["stop", "FT1", "cw:K0RX"]
++
++
++def test_manual_send_waits_for_other_radios_manual_transmission(radio, arb):
++    arb.send(0, "5NN 123")  # run exchange going out
++    radio.transmitting = True
++    radio.advance(0.2, arb)
++    arb.set_focus(1)
++    arb.send(1, "K0RX")
++    assert "stop" not in radio.log  # a manual send is never cut off
++    radio.advance(1.0, arb)
++    assert "cw:K0RX" not in radio.log
++    radio.transmitting = False
++    radio.advance(0.4, arb)
++    assert radio.log == ["cw:5NN 123", "FT1", "cw:K0RX"]
++
++
++def test_queued_sends_for_same_radio_go_together(radio, arb):
++    arb.send(0, "CQ", "cq")
++    radio.transmitting = True
++    radio.advance(0.1, arb)
++    arb.send(1, "K0RX")  # interrupts the CQ
++    arb.send(1, "5NN")
++    radio.transmitting = False
++    radio.advance(0.5, arb)
++    assert radio.log == ["cw:CQ", "stop", "FT1", "cw:K0RX", "cw:5NN"]
++
++
++def test_send_that_never_keys_does_not_wedge(radio, arb):
++    arb.send(0, "")
++    radio.advance(2.5, arb)
++    assert not arb.busy()
++    arb.set_focus(1)
++    radio.advance(0.3, arb)
++    assert radio.log[-1] == "FT1"
++
++
++def test_busy_reflects_queue_and_transmit(radio, arb):
++    assert not arb.busy()
++    radio.transmitting = True
++    assert arb.busy()
++    radio.transmitting = False
++    arb.send(1, "X")  # needs a TX move: queued
++    assert arb.busy()
++
++
++def test_clear_drops_pending(radio, arb):
++    arb.send(1, "X")
++    arb.clear()
++    radio.advance(0.5, arb)
++    assert "cw:X" not in radio.log
++
++
++def test_outside_keying_blocks_moves(radio, arb):
++    """Paddle or PTT keying that the arbiter did not start still pins TX."""
++    radio.transmitting = True
++    arb.send(1, "K0RX")
++    radio.advance(1.0, arb)
++    assert radio.log == []
++    radio.transmitting = False
++    radio.advance(0.4, arb)
++    assert radio.log == ["FT1", "cw:K0RX"]
