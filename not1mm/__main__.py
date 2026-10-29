@@ -190,6 +190,7 @@ class MainWindow(QtWidgets.QMainWindow):
     entry_frames: list = []
     sp_entry_row = None
     radio_indicators: list = []
+    prefilled: dict = {}  # entry row -> {role: text the contest prefilled}
     dark_mode = False
     current_sn = None
     # Starts false and is set true when runtime output-device checks succeed.
@@ -437,6 +438,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.other_2.installEventFilter(self)
         self.so2v_deferred = []
         self.radio_buffers = {}
+        self.prefilled = {}
         self.setup_entry_rows()
         self.so2v_timer = QtCore.QTimer()
         self.so2v_timer.timeout.connect(self.so2v_tick)
@@ -3090,6 +3092,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.dupe_indicator.hide()
         self.callsign.setStyleSheet("")
+        self.prefilled[self.active_entry_row] = {}
         self.contact = self.database.empty_contact.copy()
         self.heading_distance.setText("")
         self.history_info.setText("")
@@ -3327,6 +3330,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.worked_list = self.database.get_calls_and_bands()
         self.send_worked_list()
         self.clearinputs()
+        self.refresh_parked_prefill()
         self.update_rtc_xml()
         cmd = {}
         cmd["cmd"] = "UPDATELOG"
@@ -4256,6 +4260,49 @@ class MainWindow(QtWidgets.QMainWindow):
         if visual:
             self.update_entry_row_visuals()
 
+    def run_prefill(self) -> None:
+        """Run the contest's prefill on the active row, remembering what it
+        wrote so a serial number it filled can be refreshed later."""
+        roles = {role: widget.text() for widget, role in self.inputs_dict.items()}
+        self.contest.prefill(self)
+        filled = self.prefilled.setdefault(self.active_entry_row, {})
+        for widget, role in self.inputs_dict.items():
+            if widget.text() != roles[role]:
+                filled[role] = widget.text()
+
+    def refresh_parked_prefill(self) -> None:
+        """A QSO was just logged on the active radio. The other radio's row may
+        hold a serial number prefilled before that QSO -- the one just sent.
+        Refill whatever prefill wrote there, unless the operator changed it."""
+        if not (self.so2v_active() and self.contest and self.entry_rows):
+            return
+        parked = 1 - self.active_entry_row
+        filled = self.prefilled.get(parked)
+        if not filled:
+            return
+        active = self.active_entry_row
+        self.bind_entry_row(parked, visual=False)
+        try:
+            stale = [
+                role
+                for role, value in filled.items()
+                if self.entry_rows[parked][role].text() == value
+            ]
+            if not stale:
+                return
+            for role in stale:
+                self.entry_rows[parked][role].clear()
+                del filled[role]
+            self.get_sn()
+            self.run_prefill()
+            logger.debug(
+                "SO2V: refreshed prefill on row %d: %s",
+                parked,
+                {role: self.entry_rows[parked][role].text() for role in stale},
+            )
+        finally:
+            self.bind_entry_row(active, visual=False)
+
     def apply_indicator_colors(self) -> None:
         """Green of the ESM next-key highlight; gray of an idle F key."""
         dark = self.dark_mode
@@ -4886,7 +4933,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 ):
                     self.contest.check_call_history(self)
                 if "CQ WW" in self.contest.name or "IARU HF" in self.contest.name:
-                    self.contest.prefill(self)
+                    self.run_prefill()
             return
         cmd = {}
         cmd["cmd"] = "CALLCHANGED"
@@ -5101,7 +5148,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 and "CQ WW" not in self.contest.name
                 and "IARU HF" not in self.contest.name
             ):
-                self.contest.prefill(self)
+                self.run_prefill()
 
     def check_dupe(self, call: str) -> bool:
         # TODO multi multi
@@ -5170,7 +5217,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     self.receive.setText("599")
                     self.read_macros()
                     if self.contest.name == "ICWC Medium Speed Test":
-                        self.contest.prefill(self)
+                        self.run_prefill()
                 self.show_CW_macros()
             return
 
