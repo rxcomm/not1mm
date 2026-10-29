@@ -19,6 +19,8 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 from PyQt6 import QtWidgets, uic
+from PyQt6.QtCore import QPoint, QRectF, Qt
+from PyQt6.QtGui import QColor, QPainter, QPen
 
 if __name__ == "__main__":
     print("I'm not the program you are looking for.")
@@ -30,6 +32,81 @@ FRAME_NAMES = ("callsignfield", "field1", "field2", "field3", "field4")
 LABEL_NAMES = ("callsign_label", "snt_label", "rcv_label", "other_label", "exch_label")
 
 ENTRY_ROW_LAYOUT = "horizontalLayout"
+
+FULL, UPPER, LOWER = "full", "upper", "lower"
+
+
+def indicator_states(stereo: bool, active_row: int) -> list:
+    """(shape, active) for the run row's and the S&P row's indicator.
+
+    Mono: the radio you are on is in both ears -- a full circle on its row,
+    nothing on the muted one. Stereo: run left, S&P right -- the run row
+    shows the upper half, the S&P row the lower half. Green marks the radio
+    you are on, gray the other.
+    """
+    if stereo:
+        return [(UPPER, active_row == 0), (LOWER, active_row == 1)]
+    return [(FULL, True) if row == active_row else (None, False) for row in (0, 1)]
+
+
+class RadioIndicator(QtWidgets.QWidget):
+    """Circle left of a row's callsign box: which radio is active (green vs
+    gray) and what you are hearing from it (full, half, or nothing)."""
+
+    def __init__(self, line_edit: QtWidgets.QLineEdit) -> None:
+        super().__init__()
+        self.line_edit = line_edit
+        self.shape = None
+        self.active = False
+        self.active_color = QColor("#a6e3a1")
+        self.inactive_color = QColor("#313244")
+        self.inactive_edge = QColor("#45475a")
+        self.diameter = round(line_edit.sizeHint().height() * 2 / 3)
+        self.setFixedWidth(self.diameter + 12)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+
+    def set_colors(self, active: str, inactive: str, inactive_edge: str) -> None:
+        self.active_color = QColor(active)
+        self.inactive_color = QColor(inactive)
+        self.inactive_edge = QColor(inactive_edge)
+        self.update()
+
+    def set_state(self, shape, active: bool) -> None:
+        self.shape = shape
+        self.active = bool(active)
+        self.setAccessibleName(
+            f"radio {'active' if active else 'inactive'}, audio "
+            f"{ {FULL: 'both ears', UPPER: 'left', LOWER: 'right'}.get(shape, 'muted') }"
+        )
+        self.update()
+
+    def circle_rect(self) -> QRectF:
+        """Centred on the callsign box, not on the label above it."""
+        d = self.diameter
+        centre = self.mapFromGlobal(
+            self.line_edit.mapToGlobal(QPoint(0, self.line_edit.height() // 2))
+        )
+        return QRectF((self.width() - d) / 2, centre.y() - d / 2, d, d)
+
+    def paintEvent(self, _event) -> None:
+        if not self.shape:
+            return
+        rect = self.circle_rect()
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        if self.active:
+            painter.setBrush(self.active_color)
+            painter.setPen(Qt.PenStyle.NoPen)
+        else:
+            painter.setBrush(self.inactive_color)
+            painter.setPen(QPen(self.inactive_edge, 1))
+        if self.shape == FULL:
+            painter.drawEllipse(rect)
+        elif self.shape == UPPER:
+            painter.drawPie(rect, 0, 180 * 16)
+        else:
+            painter.drawPie(rect, 180 * 16, 180 * 16)
+        painter.end()
 
 
 class FanOut:

@@ -82,7 +82,9 @@ from not1mm.lib.entry_rows import (
     FRAME_NAMES,
     LABEL_NAMES,
     FanOut,
+    RadioIndicator,
     build_entry_row,
+    indicator_states,
 )
 from not1mm.lib.flexcat_tx import FlexCatTxSelect
 from not1mm.lib.so2v_tx import So2vTxArbiter
@@ -187,6 +189,8 @@ class MainWindow(QtWidgets.QMainWindow):
     entry_rows: list = []
     entry_frames: list = []
     sp_entry_row = None
+    radio_indicators: list = []
+    dark_mode = False
     current_sn = None
     # Starts false and is set true when runtime output-device checks succeed.
     voice_output_available = False
@@ -1556,6 +1560,8 @@ class MainWindow(QtWidgets.QMainWindow):
         """Apply Catppuccin Mocha (dark) or system palette (light)."""
 
         logger.debug(f"Dark mode set to: {setdarkmode}")
+        self.dark_mode = bool(setdarkmode)
+        self.apply_indicator_colors()
 
         cmd = {"cmd": "DARKMODE", "state": setdarkmode}
         if self.bandmap_window:
@@ -3949,6 +3955,7 @@ class MainWindow(QtWidgets.QMainWindow):
             logger.info("SO2V audio: mono on trx %d", active)
         if not sent:
             logger.warning("SO2V audio not applied: TCI offline")
+        self.update_radio_indicators()
 
     # ---- SO2V transmit ----
 
@@ -4211,6 +4218,14 @@ class MainWindow(QtWidgets.QMainWindow):
             sp[role].cursorPositionChanged.connect(self.check_esm)
         for widget in sp.values():
             widget.installEventFilter(self)
+        # Radio / audio indicators, left of each callsign box.
+        self.radio_indicators = [
+            RadioIndicator(self.entry_rows[0]["callsign"]),
+            RadioIndicator(self.entry_rows[1]["callsign"]),
+        ]
+        self.horizontalLayout.insertWidget(0, self.radio_indicators[0], 0)
+        row.layout().insertWidget(0, self.radio_indicators[1], 0)
+        self.apply_indicator_colors()
         row.hide()
 
     def entry_role_of(self, widget) -> str | None:
@@ -4241,6 +4256,28 @@ class MainWindow(QtWidgets.QMainWindow):
         if visual:
             self.update_entry_row_visuals()
 
+    def apply_indicator_colors(self) -> None:
+        """Green of the ESM next-key highlight; gray of an idle F key."""
+        dark = self.dark_mode
+        for indicator in self.radio_indicators:
+            indicator.set_colors(
+                catppuccin.GREEN,
+                catppuccin.SURFACE0 if dark else catppuccin.L_SURFACE0,
+                catppuccin.SURFACE1 if dark else catppuccin.L_SURFACE1,
+            )
+
+    def update_radio_indicators(self) -> None:
+        """Show which radio is active and what is in your ears (SO2V only)."""
+        if not self.radio_indicators:
+            return
+        so2v = self.so2v_active()
+        states = indicator_states(
+            bool(self.pref.get("tci_audio_stereo", False)), self.active_entry_row
+        )
+        for indicator, (shape, active) in zip(self.radio_indicators, states):
+            indicator.setVisible(so2v)
+            indicator.set_state(shape, active)
+
     def update_entry_row_visuals(self) -> None:
         """Show the S&P row only with SO2V; dim and lock the inactive row."""
         so2v = self.so2v_active()
@@ -4256,6 +4293,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     frame.setGraphicsEffect(effect)
             for widget in self.entry_rows[index].values():
                 widget.setReadOnly(not active)
+        self.update_radio_indicators()
 
     def configure_so2v(self) -> None:
         """(Re)start SO2V after the radio connection is (re)built."""
