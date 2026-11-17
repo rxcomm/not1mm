@@ -191,6 +191,19 @@ class Radio(QObject):
         set_audio = getattr(self.cat, "set_rx_audio", None)
         return bool(set_audio and set_audio(trx, pan, mute))
 
+    def swap_tci_settings(self, a: int = 0, b: int = 1) -> bool:
+        """Trade frequency, mode and filter between two TCI trx. False for
+        backends without trx, or when either trx's state is unknown."""
+        swap = getattr(self.cat, "swap_trx_settings", None)
+        if swap is None or not swap(a, b):
+            return False
+        # The active trx's readings changed under us: refresh them now.
+        self.vfoa = self.cat.get_vfo() or self.vfoa
+        self.mode = self.cat.get_mode() or self.mode
+        self.bw = self.cat.get_bw() or self.bw
+        self.vfo_set_at = time.monotonic()
+        return True
+
     def set_tci_trx(self, trx: int) -> bool:
         """Switch the TCI backend to another transceiver. Returns False for
         backends that have no notion of trx."""

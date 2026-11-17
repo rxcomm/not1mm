@@ -119,11 +119,14 @@ class TciCAT(CAT):
         return True
 
     def is_transmitting(self) -> bool:
-        """True while any trx reports transmitting, whichever is active."""
+        """True while the radio's one transmitter is keyed, on any slice."""
         if not self.online:
             return False
-        count = max(int(self.client.get("trx_count", 0) or 0), 2)
-        return any(self.client.get_trx("ptt", trx) == "1" for trx in range(count))
+        return bool(self.client.get("tx_on", False))
+
+    def reset_tx_state(self) -> None:
+        """Forget the cached TX state; the next edge from the radio restores it."""
+        self.client.reset_tx_state()
 
     def get_mode_list(self) -> list:
         """Get a list of modes supported by the radio.
@@ -152,6 +155,41 @@ class TciCAT(CAT):
         if not self.online:
             return False
         self.client.send(build_command("modulation", self.trx, not1mm_mode_to_tci(mode)))
+        return True
+
+    def swap_trx_settings(self, a: int = 0, b: int = 1) -> bool:
+        """Trade frequency, mode and filter between two trx (slices).
+
+        Only what AetherSDR reports live is swapped: RIT/XIT, AGC and noise
+        settings arrive in the connect handshake only, so not1mm's copies go
+        stale and swapping them would do harm. Antennas stay with the slice.
+        Returns False, sending nothing, unless both trx are fully known.
+        """
+        if not self.online:
+            return False
+        # Snapshot everything first: the second half of the swap must not
+        # read values the first half has already overwritten.
+        keys = ("vfo", "modulation", "filter", "mode", "bw")
+        snap = {
+            trx: {key: self.client.get_trx(key, trx) for key in keys} for trx in (a, b)
+        }
+        for trx, values in snap.items():
+            if not values["vfo"].isnumeric() or not values["modulation"]:
+                logger.warning("swap_trx_settings: trx %d state unknown: %s", trx, values)
+                return False
+        for trx, other in ((a, b), (b, a)):
+            new = snap[other]
+            # Mode before filter: changing mode resets the filter.
+            self.client.send(build_command("vfo", trx, 0, new["vfo"]))
+            self.client.send(build_command("modulation", trx, new["modulation"]))
+            if new["filter"]:
+                low, high = new["filter"].split(",")
+                self.client.send(build_command("rx_filter_band", trx, low, high))
+            # Update the cache now, as set_vfo does, so displays and polls
+            # show the swapped state before the radio echoes it.
+            for key in keys:
+                if new[key]:
+                    self.client.set_for_trx(str(trx), key, new[key])
         return True
 
     def ptt_on(self) -> bool:

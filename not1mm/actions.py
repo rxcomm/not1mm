@@ -20,6 +20,11 @@ default_key_bindings = {
     "Ctrl+R": "TOGGLE_RUN",
     "\\": "SWAP_RADIO",
     "Ctrl+\\": "TOGGLE_SO2V_AUDIO",
+    # Ctrl-^ arrives as Ctrl+Shift+^ on a US layout; bind every form.
+    "Ctrl+^": "SWAP_RADIO_CONFIG",
+    "Ctrl+Shift+^": "SWAP_RADIO_CONFIG",
+    "Ctrl+6": "SWAP_RADIO_CONFIG",
+    "Ctrl+Shift+6": "SWAP_RADIO_CONFIG",
     "Ctrl+L": "LOG_NOW",
     "Ctrl+=": "LOG_NOW",
     "Ctrl+Shift+K": "TOGGLE_CW_INPUT",
@@ -62,6 +67,11 @@ def TOGGLE_RUN(self) -> None:
 def SWAP_RADIO(self) -> None:
     """Swap Run (TCI TRX 0) and S&P (TCI TRX 1) radios"""
     self.swap_radio()
+
+
+def SWAP_RADIO_CONFIG(self) -> None:
+    """Trade frequency, mode and filter between the Run and S&P radios"""
+    self.swap_radio_config()
 
 
 def TOGGLE_SO2V_AUDIO(self) -> None:

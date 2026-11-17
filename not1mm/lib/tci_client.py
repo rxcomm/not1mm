@@ -43,7 +43,16 @@ RECONNECT_BACKOFF_MS = (1000, 2000, 5000)
 
 # Live state TCI reports per transceiver, and its value before any frame for
 # that trx has arrived.
-PER_TRX_DEFAULTS = {"vfo": "", "mode": "", "bw": "", "ptt": "0"}
+PER_TRX_DEFAULTS = {
+    "vfo": "",
+    "mode": "",
+    "bw": "",
+    "ptt": "0",
+    # As the radio reported them, so a slice's settings can be sent back
+    # verbatim (the SO2V radio-config swap).
+    "modulation": "",
+    "filter": "",
+}
 PER_TRX_KEYS = frozenset(PER_TRX_DEFAULTS)
 
 
@@ -86,6 +95,7 @@ class TCIClient(QObject):
             "modes": [],
             "trx_count": 0,
             "ready": False,
+            "tx_on": False,
         }
         # trx index (str) -> {"vfo", "mode", "bw", "ptt"}
         self.trx_state = {}
@@ -135,7 +145,16 @@ class TCIClient(QObject):
         trip we do not need."""
         with QMutexLocker(self.mutex):
             self.state["ready"] = False
+            self.state["tx_on"] = False
             self.trx_state.clear()
+
+    def reset_tx_state(self) -> None:
+        """Forget the cached TX state (operator hit stop). The radio's next
+        edge re-establishes it."""
+        with QMutexLocker(self.mutex):
+            self.state["tx_on"] = False
+            for entry in self.trx_state.values():
+                entry["ptt"] = "0"
 
     def send(self, command: str) -> None:
         """Queue a command onto the TCI thread. Safe from any thread -- the
@@ -178,13 +197,21 @@ class TCIClient(QObject):
                 self.set_for_trx(trx, "vfo", args[2])
         elif name == "modulation" and trx is not None and len(args) >= 2:
             self.set_for_trx(trx, "mode", tci_mode_to_not1mm(args[1]))
+            self.set_for_trx(trx, "modulation", args[1].strip())
         elif name == "rx_filter_band" and trx is not None and len(args) >= 3:
             bandwidth = bandwidth_from_filter_band(args[1], args[2])
             if bandwidth:
                 self.set_for_trx(trx, "bw", bandwidth)
+                self.set_for_trx(trx, "filter", f"{args[1].strip()},{args[2].strip()}")
         elif name == "trx" and trx is not None and len(args) >= 2:
             ptt = "1" if args[1].strip().lower() == "true" else "0"
             self.set_for_trx(trx, "ptt", ptt)
+            # One transmitter: the most recent edge is the radio's TX state,
+            # whatever trx it is labelled with. AetherSDR labels each edge with
+            # the slice holding TX at that instant, so a key-down and its
+            # key-up can carry different trx numbers if TX moves in between;
+            # tracking per trx would then leave one trx "keyed" forever.
+            self.set("tx_on", ptt == "1")
         elif name == "modulations_list":
             self.set("modes", [tci_mode_to_not1mm(m) for m in args if m])
         else:

@@ -7,7 +7,10 @@ the operator works stations on the S&P radio (trx 1); every CW transmission is
 routed to the slice it belongs to by moving TX between transmissions.
 
 Rules:
-  * TX is only ever moved while nothing is transmitting.
+  * TX is only ever moved between messages, never inside one. With semi
+    break-in or QSK the radio unkeys in every gap of a message, so a single
+    key-up does not mean the message is over: a message is over only once the
+    radio has stayed unkeyed for longer than any gap inside it (quiet_s).
   * A send to the radio that already holds TX goes straight out (CWX appends
     to its own buffer), exactly as before SO2V.
   * A manual send to the other radio interrupts an auto-CQ in progress: the
@@ -37,6 +40,16 @@ logger = logging.getLogger("so2v_tx")
 START_TIMEOUT_S = 2.0
 # How long to wait for an aborted CQ to unkey before giving up waiting.
 STOP_TIMEOUT_S = 2.0
+# Quiet time that ends an aborted message: the buffer was cleared, so no
+# further word is coming once the radio unkeys.
+ABORT_QUIET_S = 0.2
+
+
+def quiet_seconds(wpm: int) -> float:
+    """Unkeyed time that means a CW message has ended: one and a half word
+    spaces (7 dits) at this speed, and never less than 0.35 s."""
+    dit = 1.2 / max(int(wpm or 20), 5)
+    return max(0.35, 1.5 * 7 * dit)
 
 
 @dataclass
@@ -56,6 +69,7 @@ class So2vTxArbiter:
     clock: object = time.monotonic
     settle_s: float = 0.15  # time for the radio to apply a TX-slice move
     on_cq_interrupted: object = None  # () -> None
+    quiet_s: float = 0.63  # unkeyed time that ends a message; see quiet_seconds
 
     tx_slice: int | None = None
     focus: int = 0
@@ -63,6 +77,7 @@ class So2vTxArbiter:
     current: Transmission | None = None
     settle_until: float = 0.0
     abort_until: float = 0.0
+    last_keyed: float = float("-inf")  # last moment the radio was seen keyed
 
     # ---- state ----
 
@@ -78,14 +93,27 @@ class So2vTxArbiter:
         tick, never mid-transmission."""
         self.focus = int(trx)
 
+    def observe(self) -> bool:
+        """Sample the radio. Returns True while keyed."""
+        transmitting = bool(self.is_transmitting())
+        if transmitting:
+            self.last_keyed = self.clock()
+        return transmitting
+
+    def quiet(self, quiet_s: float | None = None) -> bool:
+        """Unkeyed, and unkeyed for long enough that no message is mid-flight."""
+        if self.observe():
+            return False
+        hold = self.quiet_s if quiet_s is None else quiet_s
+        return self.clock() - self.last_keyed >= hold
+
+    def in_progress(self) -> bool:
+        """A message is on the air, starting, being aborted, or between words."""
+        return self.current is not None or self.abort_until > 0 or not self.quiet()
+
     def busy(self) -> bool:
         """True while anything is transmitting, aborting or waiting to go."""
-        return (
-            self.current is not None
-            or bool(self.queue)
-            or self.abort_until > 0
-            or bool(self.is_transmitting())
-        )
+        return bool(self.queue) or self.in_progress()
 
     def needs_tick(self) -> bool:
         return self.busy() or (self.tx_slice is not None and self.tx_slice != self.focus)
@@ -95,6 +123,9 @@ class So2vTxArbiter:
         self.queue.clear()
         self.current = None
         self.abort_until = 0.0
+        # Whatever was keyed is being stopped now: still let it fall quiet
+        # before TX may move.
+        self.last_keyed = self.clock()
 
     # ---- sending ----
 
@@ -133,7 +164,7 @@ class So2vTxArbiter:
 
     def tick(self) -> None:
         now = self.clock()
-        transmitting = bool(self.is_transmitting())
+        transmitting = self.observe()
 
         if self.current is not None:
             if not self.current.started:
@@ -142,17 +173,21 @@ class So2vTxArbiter:
                 elif now - self.current.sent_at > START_TIMEOUT_S:
                     logger.debug("SO2V: send on trx %d never keyed", self.current.trx)
                     self.current = None
-            elif not transmitting:
+            elif self.quiet():
+                # Unkeyed past any word gap: the message really is over.
                 self.current = None
         if self.current is not None:
             return
 
         if self.abort_until:
-            if transmitting and now < self.abort_until:
+            if not self.quiet(ABORT_QUIET_S) and now < self.abort_until:
                 return
+            # The aborted message's buffer was cleared: no further word is
+            # coming, so the short abort quiet time is enough.
             self.abort_until = 0.0
-        if transmitting:
-            return  # keyed by something outside the arbiter (paddle, PTT)
+            self.last_keyed = float("-inf")
+        if not self.quiet():
+            return  # keyed, or between words of something we did not send
 
         if self.queue:
             trx = self.queue[0][0]
