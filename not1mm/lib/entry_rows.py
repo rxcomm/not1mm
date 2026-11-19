@@ -63,7 +63,7 @@ class RadioIndicator(QtWidgets.QWidget):
         self.inactive_edge = QColor("#45475a")
         self.diameter = round(line_edit.sizeHint().height() * 2 / 3)
         self.setFixedWidth(self.diameter + 12)
-        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        # Clicking the indicator swaps to its row, like clicking the row.
 
     def set_colors(self, active: str, inactive: str, inactive_edge: str) -> None:
         self.active_color = QColor(active)

@@ -91,7 +91,8 @@ def test_circle_centred_on_callsign_box(indicator):
     assert abs(centre.y() - edit_centre.y()) <= 1
 
 
-def test_clicks_pass_through(indicator):
+def test_indicator_receives_clicks(indicator):
+    """Clicking a row's indicator swaps to that row, so it must get clicks."""
     from PyQt6.QtCore import Qt
 
-    assert indicator.testAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+    assert not indicator.testAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
