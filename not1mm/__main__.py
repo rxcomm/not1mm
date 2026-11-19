@@ -191,6 +191,7 @@ class MainWindow(QtWidgets.QMainWindow):
     entry_frames: list = []
     sp_entry_row = None
     radio_indicators: list = []
+    so2v_row_widgets: dict = {}
     prefilled: dict = {}  # entry row -> {role: text the contest prefilled}
     dark_mode = False
     current_sn = None
@@ -2874,18 +2875,25 @@ class MainWindow(QtWidgets.QMainWindow):
         then forwarded to MainWindow.keyPressEvent.
         """
 
-        if (
-            event.type() == QEvent.Type.FocusIn
-            and self.so2v_active()
-            and self.entry_rows
-            and obj in self.entry_rows[1 - self.active_entry_row].values()
-        ):
-            # Clicked into the other radio's row: make it the active radio.
-            self.so2v_focus_role = self.entry_role_of(obj)
-            QtCore.QTimer.singleShot(
-                0, lambda: self.set_running(self.active_entry_row == 1)
-            )
-            return False
+        row = self.so2v_row_widgets.get(obj)
+        if row is not None and self.so2v_active():
+            if event.type() in (
+                QEvent.Type.MouseButtonPress,
+                QEvent.Type.MouseButtonDblClick,
+            ):
+                if event.button() == Qt.MouseButton.LeftButton:
+                    return self.so2v_row_clicked(row, self.entry_role_of(obj))
+            elif (
+                event.type() == QEvent.Type.FocusIn
+                and row != self.active_entry_row
+                and event.reason() != Qt.FocusReason.MouseFocusReason
+            ):
+                # Focus reached the other row some other way (keyboard focus
+                # chain): treat it as a click there, then hand focus back to
+                # the active row until the swap actually happens.
+                role = self.entry_role_of(obj)
+                QtCore.QTimer.singleShot(0, lambda: self.so2v_row_clicked(row, role))
+                return False
         if event.type() != QEvent.Type.KeyPress:
             return False
         return self.process_key_bindings(event, obj=obj)
@@ -4213,6 +4221,29 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ---- SO2V radio swap ----
 
+    def so2v_row_clicked(self, row: int, role: str | None) -> bool:
+        """A click anywhere in an entry row (fields, labels, indicator) does
+        exactly what \\ does. Returns True when the click was used up.
+
+        Clicking the other row swaps to it -- at once, or once the current
+        transmission has finished -- and the cursor then lands in the field
+        that was clicked. Until the swap happens, keyboard focus stays in the
+        active row, so nothing typed meanwhile is lost. Clicking back in the
+        active row while a swap is waiting cancels it, like a second \\.
+        """
+        if row == self.active_entry_row:
+            if self.so2v_pending_swap is not None:
+                self.swap_radio()  # cancels the pending swap
+            return False  # let the click place the cursor as usual
+        self.so2v_focus_role = role or "callsign"
+        if self.so2v_pending_swap is None:
+            self.swap_radio()
+        if self.active_entry_row != row:
+            # Deferred until TX ends: keep typing in the active row.
+            if self.inputs_dict and not any(w.hasFocus() for w in self.inputs_dict):
+                self.callsign.setFocus()
+        return True
+
     def swap_radio(self) -> None:
         """Swap between the Run (trx 0) and S&P (trx 1) radios.
 
@@ -4226,6 +4257,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.so2v_pending_swap is not None:
             self.so2v_pending_swap = None
             self.so2v_deferred = []
+            self.so2v_focus_role = None
             logger.debug("SO2V: pending swap cancelled")
             return
         self.set_running(not self.pref.get("run_state", False))
@@ -4354,6 +4386,19 @@ class MainWindow(QtWidgets.QMainWindow):
         self.horizontalLayout.insertWidget(0, self.radio_indicators[0], 0)
         row.layout().insertWidget(0, self.radio_indicators[1], 0)
         self.apply_indicator_colors()
+        # Every part of a row -- entry fields, their frames and labels, the
+        # indicator -- is a click target for swapping to that row.
+        self.so2v_row_widgets = {}
+        for index in (0, 1):
+            parts = list(self.entry_rows[index].values())
+            for frame in self.entry_frames[index]:
+                parts.append(frame)
+                parts.extend(frame.findChildren(QtWidgets.QLabel))
+            parts.append(self.radio_indicators[index])
+            for widget in parts:
+                self.so2v_row_widgets[widget] = index
+                if widget not in self.entry_rows[index].values():
+                    widget.installEventFilter(self)
         row.hide()
 
     def entry_role_of(self, widget) -> str | None:
