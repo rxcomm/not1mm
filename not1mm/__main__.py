@@ -87,7 +87,7 @@ from not1mm.lib.entry_rows import (
     indicator_states,
 )
 from not1mm.lib.flexcat_tx import FlexCatTxSelect
-from not1mm.lib.so2v_tx import So2vTxArbiter
+from not1mm.lib.so2v_tx import So2vTxArbiter, quiet_seconds
 from not1mm.lib.about import About
 from not1mm.lib.cwinterface import CW
 from not1mm.lib.database import DataBase
@@ -182,6 +182,7 @@ class MainWindow(QtWidgets.QMainWindow):
     tx_select = None
     tx_arbiter = None
     so2v_pending_swap = None  # Run/S&P target waiting for TX to go idle
+    so2v_pending_config_swap = False  # Ctrl-^ waiting for TX to go idle
     so2v_deferred: list = []
     so2v_send_kind = "manual"
     so2v_focus_role = None  # field clicked in the inactive row
@@ -2727,6 +2728,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.auto_cq = False
         if self.tx_arbiter is not None:
             self.tx_arbiter.clear()
+            # Safety valve: if a lost or mislabelled edge ever left not1mm
+            # thinking the radio is keyed, Esc gets you out of it. The radio's
+            # next edge re-establishes the real state.
+            reset = getattr(getattr(self.rig_control, "cat", None), "reset_tx_state", None)
+            if reset is not None:
+                reset()
         self.leftdot.hide()
         self.cwprogressBar.hide()
         if self.cw is not None:
@@ -3981,11 +3988,21 @@ class MainWindow(QtWidgets.QMainWindow):
         return bool(is_tx and is_tx())
 
     def so2v_tx_in_progress(self) -> bool:
-        """A transmission is on the air, starting, or being aborted."""
-        if self.tci_transmitting():
-            return True
+        """A message is on the air, starting, being aborted, or between words.
+        A single key-up is not the end of a message: with break-in the radio
+        unkeys in every word gap."""
         arbiter = self.tx_arbiter
-        return bool(arbiter and (arbiter.current is not None or arbiter.abort_until))
+        if arbiter is None:
+            return self.tci_transmitting()
+        return arbiter.in_progress()
+
+    def so2v_quiet_seconds(self) -> float:
+        """Unkeyed time that ends a CW message, from the current CW speed
+        (override with so2v_quiet_ms in not1mm.json)."""
+        override = int(self.pref.get("so2v_quiet_ms", 0) or 0)
+        if override:
+            return override / 1000
+        return quiet_seconds(self.cw_speed.value())
 
     def so2v_defer(self, run: bool, action=None) -> None:
         """Hold a swap (and optionally what follows it) until TX is idle."""
@@ -3997,7 +4014,12 @@ class MainWindow(QtWidgets.QMainWindow):
         """Timer-driven: runs the TX arbiter, deferred swaps and auto-CQ."""
         if not self.so2v_active() or self.tx_arbiter is None:
             return
+        self.tx_arbiter.quiet_s = self.so2v_quiet_seconds()
         self.tx_arbiter.tick()
+        if self.so2v_pending_config_swap and not self.so2v_tx_in_progress():
+            self.so2v_pending_config_swap = False
+            self.swap_radio_config()
+            return
         if self.so2v_pending_swap is not None and not self.so2v_tx_in_progress():
             target = self.so2v_pending_swap
             actions = self.so2v_deferred
@@ -4010,6 +4032,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if (
             self.auto_cq
             and self.so2v_pending_swap is None
+            and not self.so2v_pending_config_swap
             and datetime.datetime.now(tz=datetime.UTC) > self.auto_cq_time
             and not self.tx_arbiter.busy()
         ):
@@ -4019,6 +4042,97 @@ class MainWindow(QtWidgets.QMainWindow):
             self.auto_cq_then = now
             self.auto_cq_time = now + datetime.timedelta(milliseconds=self.auto_cq_delay)
             self.so2v_send_auto_cq()
+
+    def swap_radio_config(self) -> None:
+        """Ctrl-^: the Run and S&P radios trade frequency, mode and filter.
+
+        The rows stay put -- top is still Run, bottom still S&P -- so a band
+        that has opened up can become the run band in one keystroke. A
+        half-entered QSO moves with its frequency, so nothing is ever logged
+        on the wrong band. Antennas stay with their slice. Pressed during a
+        transmission it waits, like the radio swap; pressed again while
+        waiting, it cancels.
+        """
+        if not self.so2v_active():
+            logger.debug("swap_radio_config ignored: TCI SO2V not enabled")
+            return
+        if self.so2v_tx_in_progress():
+            self.so2v_pending_config_swap = not self.so2v_pending_config_swap
+            logger.debug(
+                "SO2V: radio-config swap %s until TX idle",
+                "deferred" if self.so2v_pending_config_swap else "cancelled",
+            )
+            return
+        if not self.rig_control.swap_tci_settings(0, 1):
+            logger.warning("SO2V: radio-config swap skipped, radio state not known yet")
+            return
+        self.swap_entry_contents()
+        cat = self.rig_control.cat
+        new_run_vfo = cat.client.get_trx("vfo", 0)
+        if new_run_vfo.isnumeric() and new_run_vfo != self.cq_freq:
+            # Ctrl+Q and the bandmap's CQ marker follow the run frequency.
+            if self.bandmap_window:
+                self.bandmap_window.msg_from_main(
+                    {
+                        "cmd": "MARKDX",
+                        "dx": "CQ",
+                        "freq": float(int(new_run_vfo) / 1000),
+                        "comment": f"CQ {cat.client.get_trx('mode', 0)} MARKED",
+                    }
+                )
+            self.cq_freq = new_run_vfo
+        vfo = str(self.rig_control.vfoa or "")
+        if vfo.isnumeric():
+            self.sandpfreq = int(vfo)
+            self.poll_radio(
+                {
+                    "vfoa": vfo,
+                    "mode": self.rig_control.mode,
+                    "bw": self.rig_control.bw,
+                    "online": self.rig_control.online,
+                    "trx": self.tci_active_trx,
+                }
+            )
+        if self.vfo_window:
+            self.vfo_window.msg_from_main(
+                {"cmd": "SET_TCI_TRX", "trx": self.tci_active_trx}
+            )
+        logger.info(
+            "SO2V: radio configs swapped, run now %s, S&P now %s",
+            cat.client.get_trx("vfo", 0),
+            cat.client.get_trx("vfo", 1),
+        )
+
+    def swap_entry_contents(self) -> None:
+        """Trade the two rows' QSOs, so each stays with its frequency."""
+        active = self.active_entry_row
+        parked = 1 - active
+        active_meta = self.capture_entry_buffer()
+        parked_meta = self.radio_buffers.pop(parked, None)
+        for role in ENTRY_ROLES:
+            mine = self.entry_rows[active][role]
+            theirs = self.entry_rows[parked][role]
+            text, other_text = mine.text(), theirs.text()
+            mine.setText(other_text)
+            theirs.setText(text)
+        self.radio_buffers[parked] = active_meta
+        self.prefilled[active], self.prefilled[parked] = (
+            self.prefilled.get(parked, {}),
+            self.prefilled.get(active, {}),
+        )
+        if parked_meta:
+            self.so2v_focus_role = active_meta["focus"]  # keep the cursor's field
+            self.restore_entry_buffer(parked_meta)
+            return
+        # The parked row was never active, so there is nothing to restore:
+        # reset what the active row derived and look its call up afresh.
+        self.contact = self.database.empty_contact.copy()
+        for label in (self.dx_entity, self.heading_distance, self.history_info):
+            label.setText("")
+        self.dupe_indicator.hide()
+        self.callsign.setStyleSheet("")
+        if self.callsign.text():
+            self.callsign_changed()
 
     def so2v_cq_interrupted(self) -> None:
         """An S&P send cut a CQ short: send the CQ again once TX is free."""
@@ -4368,6 +4482,7 @@ class MainWindow(QtWidgets.QMainWindow):
             stopcw=lambda: self.rig_control.stopcw(),
             settle_s=int(self.pref.get("so2v_tx_settle_ms", 150)) / 1000,
             on_cq_interrupted=self.so2v_cq_interrupted,
+            quiet_s=self.so2v_quiet_seconds(),
         )
         self.tx_arbiter.init_tx(self.tci_active_trx)
         self.bind_entry_row(self.tci_active_trx)

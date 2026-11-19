@@ -230,15 +230,15 @@ def test_set_trx_retargets_commands_and_client(cat):
 
 
 def test_is_transmitting_false_when_offline(cat):
-    cat.client.trx_state = {"0": {"ptt": "1"}}
+    cat.client.state["tx_on"] = True
     assert cat.is_transmitting() is False
 
 
-def test_is_transmitting_sees_either_trx(cat):
+def test_is_transmitting_reads_the_one_transmitter(cat):
     go_online(cat)
-    cat.client.trx_state = {"0": {"ptt": "0"}, "1": {"ptt": "1"}}
+    cat.client.state["tx_on"] = True
     assert cat.is_transmitting() is True
-    cat.client.trx_state = {"0": {"ptt": "0"}, "1": {"ptt": "0"}}
+    cat.client.state["tx_on"] = False
     assert cat.is_transmitting() is False
 
 
@@ -277,3 +277,47 @@ def test_set_vfo_updates_cache_before_the_echo(cat_trx1):
     cat_trx1.client.trx_state = {"1": {"vfo": "7025000"}}
     cat_trx1.set_vfo("7030000")
     assert cat_trx1.client.get_trx("vfo", 1) == "7030000"
+
+
+# ---- Ctrl-^: trade frequency, mode and filter between the two slices ----
+
+
+def two_slices(cat):
+    go_online(cat)
+    cat.client.trx_state = {
+        "0": {"vfo": "14030000", "modulation": "cw", "filter": "-250,250", "mode": "CW", "bw": "500"},
+        "1": {"vfo": "7185000", "modulation": "lsb", "filter": "-2800,-100", "mode": "LSB", "bw": "2700"},
+    }
+
+
+def test_swap_trx_settings_sends_each_slice_the_others_settings(cat):
+    two_slices(cat)
+    assert cat.swap_trx_settings(0, 1) is True
+    assert cat.client.sent == [
+        "vfo:0,0,7185000;",
+        "modulation:0,lsb;",
+        "rx_filter_band:0,-2800,-100;",
+        "vfo:1,0,14030000;",
+        "modulation:1,cw;",
+        "rx_filter_band:1,-250,250;",
+    ]
+
+
+def test_swap_trx_settings_updates_cache_without_overwriting(cat):
+    """The second half must use the snapshot, not values the first half wrote."""
+    two_slices(cat)
+    cat.swap_trx_settings(0, 1)
+    get = cat.client.get_trx
+    assert (get("vfo", 0), get("mode", 0), get("bw", 0)) == ("7185000", "LSB", "2700")
+    assert (get("vfo", 1), get("mode", 1), get("bw", 1)) == ("14030000", "CW", "500")
+
+
+def test_swap_trx_settings_refuses_unknown_state(cat):
+    go_online(cat)
+    cat.client.trx_state = {"0": {"vfo": "14030000", "modulation": "cw"}, "1": {"vfo": ""}}
+    assert cat.swap_trx_settings(0, 1) is False
+    assert cat.client.sent == []
+
+
+def test_swap_trx_settings_offline(cat):
+    assert cat.swap_trx_settings(0, 1) is False

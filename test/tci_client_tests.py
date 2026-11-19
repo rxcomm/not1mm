@@ -323,3 +323,40 @@ def test_clear_state_drops_every_trx(client):
 def test_non_numeric_trx_index_is_ignored(client):
     client.handle_frame("vfo", ["x", "0", "14030000"])
     assert client.get_trx("vfo", "x") == ""
+
+
+# ---- one transmitter: TX state follows the latest edge, any trx label ----
+
+
+def test_tx_state_follows_latest_edge_any_trx(client):
+    client.handle_frame("trx", ["0", "true"])
+    assert client.get("tx_on") is True
+    client.handle_frame("trx", ["1", "false"])
+    assert client.get("tx_on") is False
+
+
+def test_mislabelled_unkey_does_not_leave_radio_keyed(client):
+    """Regression: AetherSDR labels each edge with the slice holding TX at
+    that instant. If TX moves mid-word the key-down says trx 0 and the key-up
+    trx 1; tracking per trx left trx 0 'keyed' forever and wedged SO2V."""
+    client.on_text_message("trx:0,true;trx:1,false;")
+    assert client.get("tx_on") is False
+
+
+def test_reset_tx_state(client):
+    client.on_text_message("trx:0,true;")
+    client.reset_tx_state()
+    assert client.get("tx_on") is False
+    assert client.get_trx("ptt", 0) == "0"
+
+
+def test_disconnect_clears_tx_state(client):
+    client.on_text_message("trx:0,true;")
+    client.clear_state()
+    assert client.get("tx_on") is False
+
+
+def test_raw_modulation_and_filter_cached_for_swap(client):
+    client.on_text_message("modulation:1,lsb;rx_filter_band:1,-2800,-100;")
+    assert client.get_trx("modulation", 1) == "lsb"
+    assert client.get_trx("filter", 1) == "-2800,-100"
